@@ -1,0 +1,570 @@
+<?php
+// Set session configuration
+ini_set('session.cookie_httponly', 1);
+ini_set('session.use_only_cookies', 1);
+ini_set('session.cookie_secure', isset($_SERVER['HTTPS']));
+ini_set('session.cookie_samesite', 'Lax');
+ini_set('session.gc_maxlifetime', 3600); // 1 hour
+ini_set('session.cookie_lifetime', 0); // Until browser closes
+
+// Start session if not already started
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// Debug session state
+error_log("Session check - Current session state: " . print_r($_SESSION, true));
+
+// Get current page name
+$current_page = basename($_SERVER['PHP_SELF']);
+
+// Skip authentication check for login and registration pages
+if (!in_array($current_page, ['login.php', 'register.php', 'google_callback.php'])) {
+    // Check if user is logged in
+    if (!isset($_SESSION['user_id'])) {
+        // Debug unauthorized access
+        error_log("Unauthorized access attempt - No user_id in session");
+        
+        // Set error message
+        $_SESSION['message'] = "Please log in to access this page";
+        $_SESSION['message_type'] = "error";
+        
+        // Redirect to login page
+        header("Location: login.php");
+        exit();
+    }
+
+    // Verify session data integrity
+    if (!isset($_SESSION['user_name'])) {
+        // If user_name is not set but we have user_id, try to get it from database
+        require_once 'db.php';
+        $conn = getDBConnection();
+        
+        if ($conn) {
+            $stmt = $conn->prepare("SELECT name FROM users WHERE id = ?");
+            if ($stmt) {
+                $stmt->bind_param("i", $_SESSION['user_id']);
+                $stmt->execute();
+                $result = $stmt->get_result();
+                
+                if ($row = $result->fetch_assoc()) {
+                    $_SESSION['user_name'] = $row['name'];
+                    error_log("Retrieved user_name from database: " . $_SESSION['user_name']);
+                }
+                
+                $stmt->close();
+            }
+            $conn->close();
+        }
+    }
+
+    // Check session age (optional security measure)
+    $session_lifetime = 24 * 60 * 60; // 24 hours
+    if (isset($_SESSION['login_time']) && (time() - $_SESSION['login_time'] > $session_lifetime)) {
+        // Session expired
+        session_unset();
+        session_destroy();
+        
+        // Set error message
+        $_SESSION['message'] = "Your session has expired. Please log in again.";
+        $_SESSION['message_type'] = "error";
+        
+        // Redirect to login page
+        header("Location: login.php");
+        exit();
+    }
+
+    // Update last activity time
+    $_SESSION['last_activity'] = time();
+}
+
+// Function to display messages
+function displayMessage() {
+    if (isset($_SESSION['message'])) {
+        $type = $_SESSION['message_type'] ?? 'info';
+        $message = $_SESSION['message'];
+        
+        // Clear the message
+        unset($_SESSION['message']);
+        unset($_SESSION['message_type']);
+        
+        // Return formatted message
+        return "<div class='alert alert-{$type}'>{$message}</div>";
+    }
+    return '';
+}
+
+// Function to generate CSRF token
+function generateCSRFToken() {
+    if (!isset($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+// Function to validate CSRF token
+function validateCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+?>
+
+<?php
+require_once 'vendor/autoload.php';
+require_once 'config/google_oauth.php';
+
+// Function to send email using Gmail API
+function sendEmail($to, $subject, $message) {
+    try {
+        // Get the user's access token from the database
+        $conn = getDBConnection();
+        if (!$conn) {
+            throw new Exception("Database connection failed");
+        }
+
+        $stmt = $conn->prepare("
+            SELECT access_token, refresh_token, token_expiry 
+            FROM users 
+            WHERE email = ?
+        ");
+        $stmt->bind_param("s", $to);
+        $stmt->execute();
+        $result = $stmt->get_result();
+        
+        if ($user = $result->fetch_assoc()) {
+            $access_token_data = json_decode($user['access_token'], true);
+            
+            // Check if token needs refresh
+            if (strtotime($user['token_expiry']) <= time()) {
+                if ($user['refresh_token']) {
+                    $new_token_data = refreshGoogleAccessToken($user['refresh_token']);
+                    $access_token_data = $new_token_data;
+                    
+                    // Update token in database
+                    $updateStmt = $conn->prepare("
+                        UPDATE users 
+                        SET access_token = ?,
+                            token_expiry = DATE_ADD(NOW(), INTERVAL ? SECOND)
+                        WHERE email = ?
+                    ");
+                    $token_json = json_encode($new_token_data);
+                    $updateStmt->bind_param("sis", $token_json, $new_token_data['expires_in'], $to);
+                    $updateStmt->execute();
+                } else {
+                    throw new Exception("Access token expired and no refresh token available");
+                }
+            }
+        } else {
+            throw new Exception("User not found");
+        }
+
+        // Create Gmail API client
+        $client = new Google_Client();
+        $client->setAuthConfig(__DIR__ . '/../credentials.json');
+        $client->addScope('https://www.googleapis.com/auth/gmail.send');
+        $client->setAccessToken($access_token_data);
+
+        // Create Gmail service
+        $service = new Google_Service_Gmail($client);
+
+        // Create email message
+        $email = new Google_Service_Gmail_Message();
+        $email->setRaw(base64_encode("
+            From: Task Scheduler <noreply@taskscheduler.com>
+            To: $to
+            Subject: $subject
+            Content-Type: text/html; charset=UTF-8
+            MIME-Version: 1.0
+
+            $message
+        "));
+
+        // Send email
+        $service->users_messages->send('me', $email);
+        return true;
+    } catch (Exception $e) {
+        error_log("Email sending failed: " . $e->getMessage());
+        return false;
+    }
+}
+?>
+<?php
+require_once 'config/session_check.php';
+require_once 'config/db.php';
+
+// Get user's tasks and statistics
+$tasks = [];
+$stats = [
+    'total' => 0,
+    'pending' => 0,
+    'completed' => 0,
+    'priority_distribution' => ['High' => 0, 'Medium' => 0, 'Low' => 0],
+    'completion_rate' => ['Completed' => 0, 'In Progress' => 0, 'Pending' => 0],
+    'timeline' => []
+];
+
+$conn = getDBConnection();
+
+if ($conn) {
+    // Get tasks
+    $stmt = $conn->prepare("
+        SELECT t.*, u.name as username 
+        FROM tasks t 
+        JOIN users u ON t.user_id = u.id 
+        WHERE t.user_id = ? 
+        ORDER BY t.due_date ASC
+    ");
+    $stmt->bind_param("i", $_SESSION['user_id']);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    while ($row = $result->fetch_assoc()) {
+        $tasks[] = $row;
+        $stats['total']++;
+        
+        // Count by status
+        if ($row['status'] === 'Completed') {
+            $stats['completed']++;
+            $stats['completion_rate']['Completed']++;
+        } elseif ($row['status'] === 'In Progress') {
+            $stats['completion_rate']['In Progress']++;
+        } else {
+            $stats['pending']++;
+            $stats['completion_rate']['Pending']++;
+        }
+        
+        // Count by priority
+        $stats['priority_distribution'][$row['priority']]++;
+        
+        // Add to timeline
+        $date = date('Y-m-d', strtotime($row['created_at']));
+        if (!isset($stats['timeline'][$date])) {
+            $stats['timeline'][$date] = ['completed' => 0, 'in_progress' => 0];
+        }
+        if ($row['status'] === 'Completed') {
+            $stats['timeline'][$date]['completed']++;
+        } elseif ($row['status'] === 'In Progress') {
+            $stats['timeline'][$date]['in_progress']++;
+        }
+    }
+    
+    $stmt->close();
+    $conn->close();
+}
+
+<?php include 'navbar.php'; ?>
+
+    <div class="container">
+        <header>
+            <h1>Welcome, <?php echo htmlspecialchars($_SESSION['user_name'] ?? 'User'); ?>!</h1>
+            <p class="subheading">Your task management dashboard</p>
+        </header>
+
+        <!-- Stats Section with User Performance -->
+        <div class="stats-container">
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>Total Tasks</h3>
+                    <p><?php echo $stats['total']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Pending Tasks</h3>
+                    <p><?php echo $stats['pending']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Completed Tasks</h3>
+                    <p><?php echo $stats['completed']; ?></p>
+                </div>
+            </div>
+
+            <!-- Charts Grid -->
+            <div class="charts-grid">
+                <div class="chart-container">
+                    <h3>Task Completion Rate</h3>
+                    <canvas id="completionChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Priority Distribution</h3>
+                    <canvas id="priorityChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Task Status Timeline</h3>
+                    <canvas id="timelineChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Performance Progress -->
+            <div class="performance">
+                <h2>Performance Over Time</h2>
+                <canvas id="performanceChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Task Management Section -->
+        <div class="task-management">
+            <h2>Your Tasks</h2>
+            <?php if (empty($tasks)): ?>
+                <p class="no-tasks">No tasks found. <a href="add-task.php">Add your first task</a></p>
+            <?php else: ?>
+                <div class="task-list">
+                    <?php 
+                    // Sort tasks by due date and priority
+                    usort($tasks, function($a, $b) {
+                        // First sort by due date
+                        $dateCompare = strtotime($a['due_date']) - strtotime($b['due_date']);
+                        if ($dateCompare !== 0) return $dateCompare;
+                        
+                        // Then by priority (High > Medium > Low)
+                        $priorityOrder = ['High' => 3, 'Medium' => 2, 'Low' => 1];
+                        return $priorityOrder[$b['priority']] - $priorityOrder[$a['priority']];
+                    });
+                    
+                    foreach (array_slice($tasks, 0, 5) as $task): 
+                        $isOverdue = strtotime($task['due_date']) < time() && $task['status'] !== 'Completed';
+                        $statusClass = $task['status'] === 'Completed' ? 'completed' : ($isOverdue ? 'overdue' : strtolower($task['status']));
+                    ?>
+                        <div class="task-card <?php echo $statusClass; ?>">
+                            <div class="task-header">
+                                <h3><?php echo htmlspecialchars($task['title']); ?></h3>
+                                <span class="priority-badge <?php echo strtolower($task['priority']); ?>">
+                                    <?php echo $task['priority']; ?>
+                                </span>
+                            </div>
+                            <p class="task-description"><?php echo htmlspecialchars($task['description']); ?></p>
+                            <div class="task-meta">
+                                <span class="due-date <?php echo $isOverdue ? 'overdue' : ''; ?>">
+                                    <i class="fas fa-calendar"></i>
+                                    Due: <?php echo date('M d, Y', strtotime($task['due_date'])); ?>
+                                    <?php if ($isOverdue): ?>
+                                        <span class="overdue-badge">Overdue</span>
+                                    <?php endif; ?>
+                                </span>
+                                <span class="status-badge <?php echo strtolower($task['status']); ?>">
+                                    <?php echo $task['status']; ?>
+                                </span>
+                            </div>
+                            <div class="task-actions">
+                                <a href="tasks.php?view=<?php echo $task['id']; ?>" class="btn-view">View Details</a>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php if (count($tasks) > 5): ?>
+                    <div class="view-all-container">
+                        <a href="tasks.php" class="btn-view-all">
+                            <i class="fas fa-list"></i>
+                            View All Tasks
+                        </a>
+                    </div>
+                <?php endif; ?>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- Call to Action Section -->
+    <section class="cta">
+        <h2>Stay Organized and Focused!</h2>
+        <a href="add-task.php" class="btn">Add New Task</a>
+    </section>
+
+DATABASE CONNECTIVITY:
+
+<?php
+require_once 'config/session_check.php';
+require_once 'config/db.php';
+
+// Get user's tasks and statistics
+$tasks = [];
+$stats = [
+    'total' => 0,
+    'pending' => 0,
+    'completed' => 0,
+    'priority_distribution' => ['High' => 0, 'Medium' => 0, 'Low' => 0],
+    'completion_rate' => ['Completed' => 0, 'In Progress' => 0, 'Pending' => 0],
+    'timeline' => []
+];
+
+$conn = getDBConnection();
+
+if ($conn) {
+    // Get tasks
+    $stmt = $conn->prepare("
+        SELECT t.*, u.name as username 
+        FROM tasks t 
+        JOIN users u ON t.user_id = u.id 
+        WHERE t.user_id = ? 
+        ORDER BY t.due_date ASC
+    ");
+    $stmt->bind_param("i", $_SESSION['user_id']);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    
+    while ($row = $result->fetch_assoc()) {
+        $tasks[] = $row;
+        $stats['total']++;
+        
+        // Count by status
+        if ($row['status'] === 'Completed') {
+            $stats['completed']++;
+            $stats['completion_rate']['Completed']++;
+        } elseif ($row['status'] === 'In Progress') {
+            $stats['completion_rate']['In Progress']++;
+        } else {
+            $stats['pending']++;
+            $stats['completion_rate']['Pending']++;
+        }
+        
+        // Count by priority
+        $stats['priority_distribution'][$row['priority']]++;
+        
+        // Add to timeline
+        $date = date('Y-m-d', strtotime($row['created_at']));
+        if (!isset($stats['timeline'][$date])) {
+            $stats['timeline'][$date] = ['completed' => 0, 'in_progress' => 0];
+        }
+        if ($row['status'] === 'Completed') {
+            $stats['timeline'][$date]['completed']++;
+        } elseif ($row['status'] === 'In Progress') {
+            $stats['timeline'][$date]['in_progress']++;
+        }
+    }
+    
+    $stmt->close();
+    $conn->close();
+}
+
+<?php include 'navbar.php'; ?>
+
+    <div class="container">
+        <header>
+            <h1>Welcome, <?php echo htmlspecialchars($_SESSION['user_name'] ?? 'User'); ?>!</h1>
+            <p class="subheading">Your task management dashboard</p>
+        </header>
+
+        <!-- Stats Section with User Performance -->
+        <div class="stats-container">
+            <div class="stats">
+                <div class="stat-card">
+                    <h3>Total Tasks</h3>
+                    <p><?php echo $stats['total']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Pending Tasks</h3>
+                    <p><?php echo $stats['pending']; ?></p>
+                </div>
+                <div class="stat-card">
+                    <h3>Completed Tasks</h3>
+                    <p><?php echo $stats['completed']; ?></p>
+                </div>
+            </div>
+
+            <!-- Charts Grid -->
+            <div class="charts-grid">
+                <div class="chart-container">
+                    <h3>Task Completion Rate</h3>
+                    <canvas id="completionChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Priority Distribution</h3>
+                    <canvas id="priorityChart"></canvas>
+                </div>
+                <div class="chart-container">
+                    <h3>Task Status Timeline</h3>
+                    <canvas id="timelineChart"></canvas>
+                </div>
+            </div>
+
+            <!-- Performance Progress -->
+            <div class="performance">
+                <h2>Performance Over Time</h2>
+                <canvas id="performanceChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Task Management Section -->
+        <div class="task-management">
+            <h2>Your Tasks</h2>
+            <?php if (empty($tasks)): ?>
+                <p class="no-tasks">No tasks found. <a href="add-task.php">Add your first task</a></p>
+            <?php else: ?>
+                <div class="task-list">
+                    <?php 
+                    // Sort tasks by due date and priority
+                    usort($tasks, function($a, $b) {
+                        // First sort by due date
+                        $dateCompare = strtotime($a['due_date']) - strtotime($b['due_date']);
+                        if ($dateCompare !== 0) return $dateCompare;
+                        
+                        // Then by priority (High > Medium > Low)
+                        $priorityOrder = ['High' => 3, 'Medium' => 2, 'Low' => 1];
+                        return $priorityOrder[$b['priority']] - $priorityOrder[$a['priority']];
+                    });
+                    
+                    foreach (array_slice($tasks, 0, 5) as $task): 
+                        $isOverdue = strtotime($task['due_date']) < time() && $task['status'] !== 'Completed';
+                        $statusClass = $task['status'] === 'Completed' ? 'completed' : ($isOverdue ? 'overdue' : strtolower($task['status']));
+                    ?>
+                        <div class="task-card <?php echo $statusClass; ?>">
+                            <div class="task-header">
+                                <h3><?php echo htmlspecialchars($task['title']); ?></h3>
+                                <span class="priority-badge <?php echo strtolower($task['priority']); ?>">
+                                    <?php echo $task['priority']; ?>
+                                </span>
+                            </div>
+                            <p class="task-description"><?php echo htmlspecialchars($task['description']); ?></p>
+                            <div class="task-meta">
+                                <span class="due-date <?php echo $isOverdue ? 'overdue' : ''; ?>">
+                                    <i class="fas fa-calendar"></i>
+                                    Due: <?php echo date('M d, Y', strtotime($task['due_date'])); ?>
+                                    <?php if ($isOverdue): ?>
+                                        <span class="overdue-badge">Overdue</span>
+                                    <?php endif; ?>
+                                </span>
+                                <span class="status-badge <?php echo strtolower($task['status']); ?>">
+                                    <?php echo $task['status']; ?>
+                                </span>
+                            </div>
+                            <div class="task-actions">
+                                <a href="tasks.php?view=<?php echo $task['id']; ?>" class="btn-view">View Details</a>
+                            </div>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+                <?php if (count($tasks) > 5): ?>
+                    <div class="view-all-container">
+                        <a href="tasks.php" class="btn-view-all">
+                            <i class="fas fa-list"></i>
+                            View All Tasks
+                        </a>
+                    </div>
+                <?php endif; ?>
+            <?php endif; ?>
+        </div>
+    </div>
+
+    <!-- Call to Action Section -->
+    <section class="cta">
+        <h2>Stay Organized and Focused!</h2>
+        <a href="add-task.php" class="btn">Add New Task</a>
+    </section>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
